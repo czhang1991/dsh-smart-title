@@ -17,6 +17,18 @@
  *  4. 子代理会话（header.origin === 'subagent'）与 fork 子会话跳过
  *  5. 可选启动回填：对 live 且标题仍是 fallback 的会话逐个刷新
  *
+ * v0.2.0（本 fork 相对上游 0.1.9）的改动，起因是"标题永远停在 fallback"：
+ *  a. 请求形态改走 ctx.llm.prepareCall（与官方 dsh-session-title-llm 一致），
+ *     由适配器校验模型能力、补齐默认值；宿主没这个能力时退回裸 llm.stream。
+ *  b. 默认不再显式带 maxTokens（新设置 sendMaxTokens，默认 false）。实测
+ *     WorkBuddy 网关会以 400 model_param_invalid 拒绝带显式 max_tokens 的
+ *     辅助请求，而同路由的普通对话（不带该参数）完全正常——标题请求原本是
+ *     这条路由上唯一带 max_tokens 的调用。
+ *  c. 失败即换形态重试一次（带↔不带 maxTokens 互换），仍失败则试备用路由
+ *     （fallbackProvider/fallbackModel），避免整条路由不可用时标题彻底停摆。
+ *  d. 失败账本：完整错误写 ~/.dsh/plugin-data/dsh-smart-title/title-errors.jsonl，
+ *     不再只留在被宿主过滤掉的 logger 输出里。
+ *
  * 依赖解析遵循宿主沙箱惯例（hermes-loop/dsh-continue 同款）：优先宿主 dsh
  * 全局安装里的 vendored 副本，退回标准 require；schemastery 缺席只损失设置
  * UI（loader config 仍生效），dsh-llm 缺席则 LLM 调用不可用（标题保持回退），
@@ -25,7 +37,8 @@
 
 const { pathToFileURL } = require('node:url')
 const { homedir } = require('node:os')
-const { join } = require('node:path')
+const { dirname, join } = require('node:path')
+const { appendFileSync, mkdirSync, readFileSync, writeFileSync } = require('node:fs')
 
 // ── 依赖解析 ────────────────────────────────────────────────────────────────
 
@@ -137,7 +150,17 @@ const DEFAULTS = Object.freeze({
   backfillOnStart: false,
   backfillMaxSessions: 30,
   // 回填节奏间隔（ms），避免启动瞬间挤爆 LLM
-  backfillIntervalMs: 2000
+  backfillIntervalMs: 2000,
+  // 标题请求是否显式带 maxTokens。false（默认）= 不带，交给适配器/网关默认值。
+  // 动机：某些 OpenAI 兼容网关（如 WorkBuddy）会拒绝"带显式 max_tokens 的
+  // 辅助请求"，返回 400 model_param_invalid；而同样的思考开关、不带 max_tokens
+  // 的对话请求一切正常。标题请求是这条路由上唯一会带该参数的调用。
+  sendMaxTokens: false,
+  // 备用路由：主路由两次尝试都失败后再试一次（provider/model 必须成对，空=不启用）
+  fallbackProvider: '',
+  fallbackModel: '',
+  // 失败账本：每次失败把完整错误写进 ~/.dsh/plugin-data/dsh-smart-title/title-errors.jsonl
+  diagnostics: true
 })
 
 const SETTINGS_NS = 'dsh-smart-title'
@@ -163,7 +186,11 @@ function settingsSchema(Schema) {
     excludeIdPrefixes: Schema.string().default(DEFAULTS.excludeIdPrefixes).volatile(),
     backfillOnStart: Schema.boolean().default(DEFAULTS.backfillOnStart).volatile(),
     backfillMaxSessions: Schema.number().step(1).min(1).max(200).default(DEFAULTS.backfillMaxSessions).volatile(),
-    backfillIntervalMs: Schema.number().step(1).min(0).max(60000).default(DEFAULTS.backfillIntervalMs).volatile()
+    backfillIntervalMs: Schema.number().step(1).min(0).max(60000).default(DEFAULTS.backfillIntervalMs).volatile(),
+    sendMaxTokens: Schema.boolean().default(DEFAULTS.sendMaxTokens).volatile(),
+    fallbackProvider: Schema.string().default(DEFAULTS.fallbackProvider).volatile(),
+    fallbackModel: Schema.string().default(DEFAULTS.fallbackModel).volatile(),
+    diagnostics: Schema.boolean().default(DEFAULTS.diagnostics).volatile()
   })
 }
 
@@ -279,8 +306,8 @@ const NUM_RANGES = Object.freeze({
   backfillMaxSessions: [1, 200],
   backfillIntervalMs: [0, 60000]
 })
-const BOOL_KEYS = Object.freeze(['enabled', 'includeAssistant', 'refreshOnTurnEnd', 'excludeForks', 'backfillOnStart'])
-const STR_KEYS = Object.freeze(['provider', 'model', 'excludeIdPrefixes'])
+const BOOL_KEYS = Object.freeze(['enabled', 'includeAssistant', 'refreshOnTurnEnd', 'excludeForks', 'backfillOnStart', 'sendMaxTokens', 'diagnostics'])
+const STR_KEYS = Object.freeze(['provider', 'model', 'excludeIdPrefixes', 'fallbackProvider', 'fallbackModel'])
 
 /**
  * 白名单清洗设置 patch：布尔只收真布尔、数字夹取进 schema 同款范围、字符串收
@@ -300,13 +327,21 @@ function sanitizePatch(body) {
   for (const key of STR_KEYS) {
     if (typeof body[key] === 'string') patch[key] = body[key].trim()
   }
-  const hasP = typeof patch.provider === 'string' && patch.provider !== ''
-  const hasM = typeof patch.model === 'string' && patch.model !== ''
-  if (hasP !== hasM) {
-    delete patch.provider
-    delete patch.model
-  }
+  dropUnpairedRoute(patch, 'provider', 'model')
+  dropUnpairedRoute(patch, 'fallbackProvider', 'fallbackModel')
   return patch
+}
+
+/**
+ * 路由键必须成对：只给一边时两边都丢弃，避免"半配对"静默退回会话路由。
+ * 主路由与备用路由（v0.2.0）共用同一套规则。
+ */
+function dropUnpairedRoute(patch, providerKey, modelKey) {
+  const hasProvider = typeof patch[providerKey] === 'string' && patch[providerKey] !== ''
+  const hasModel = typeof patch[modelKey] === 'string' && patch[modelKey] !== ''
+  if (hasProvider === hasModel) return
+  delete patch[providerKey]
+  delete patch[modelKey]
 }
 
 /** 只透出已知设置键（不漏内部状态）。 */
@@ -442,6 +477,147 @@ function systemPrompt(cfg) {
     'Use the dominant language of the conversation.',
     `Aim for about ${cfg.targetWords} words in non-CJK languages or ${cfg.targetCjkCharacters} CJK characters.`
   ].join('\n')
+}
+
+// ── 请求形态阶梯 / 失败账本（v0.2.0）──────────────────────────────────────
+
+/**
+ * 标题请求主形态的 maxTokens：只有显式开启 sendMaxTokens 才带。
+ * 默认不带，是因为"带显式 max_tokens 的辅助请求"在部分 OpenAI 兼容网关上会被
+ * 上游以 400 model_param_invalid 拒绝，而同路由的普通对话（不带 max_tokens）正常。
+ */
+function resolvePrimaryMaxTokens(cfg) {
+  if (!cfg || cfg.sendMaxTokens !== true) return undefined
+  const n = Number(cfg.maxOutputTokens)
+  return Number.isFinite(n) && n > 0 ? n : undefined
+}
+
+/**
+ * 构造尝试阶梯：主形态 → 另一形态（带/不带 maxTokens 互换）→ 备用路由。
+ * 之所以失败就换形态再试一次：从错误文本上无法可靠区分"参数被网关拒绝"与
+ * "该模型/路由不接受辅助请求"，而标题请求本身只有 1~2k token，重试很便宜。
+ */
+function buildTitleAttempts(cfg, route) {
+  const primaryMaxTokens = resolvePrimaryMaxTokens(cfg)
+  const attempts = [{ label: 'primary', route, maxTokens: primaryMaxTokens }]
+  const configured = Number(cfg && cfg.maxOutputTokens)
+  // 互换形态：显式带 → 这次改为不带；默认不带 → 这次改为带上配置值。
+  // 两个方向互为对照——"网关是否讨厌 max_tokens"只有实测才知道。
+  const swapped =
+    cfg && cfg.sendMaxTokens === true
+      ? undefined
+      : Number.isFinite(configured) && configured > 0
+        ? configured
+        : undefined
+  if (swapped !== primaryMaxTokens) {
+    attempts.push({ label: 'primary-alt-max-tokens', route, maxTokens: swapped })
+  }
+  const fallback = resolveRouteOverride(cfg && cfg.fallbackProvider, cfg && cfg.fallbackModel)
+  if (fallback) attempts.push({ label: 'fallback', route: fallback, maxTokens: primaryMaxTokens })
+  return attempts
+}
+
+/** 失败账本文件路径；DSH_SMART_TITLE_LEDGER_DIR 可覆盖（测试与排障用）。 */
+function titleLedgerFile() {
+  const override = process.env.DSH_SMART_TITLE_LEDGER_DIR
+  const dir = override && override.trim() ? override.trim() : join(homedir(), '.dsh', 'plugin-data', PLUGIN_ID)
+  return join(dir, 'title-errors.jsonl')
+}
+
+/**
+ * 追加一条失败记录（只保留最近 200 条）。
+ * 宿主会过滤插件 logger 输出，标题失败原本只落在 stderr 里——真出问题时根本
+ * 查不到（本次排查就卡在这）。这里落一份独立账本：完整错误文本 + 当次路由与参数。
+ */
+function writeTitleFailureLedger(cfg, record) {
+  if (cfg && cfg.diagnostics === false) return
+  try {
+    const file = titleLedgerFile()
+    mkdirSync(dirname(file), { recursive: true })
+    let lines = []
+    try {
+      lines = readFileSync(file, 'utf8').split('\n').filter(Boolean)
+    } catch {}
+    lines.push(JSON.stringify({ at: new Date().toISOString(), ...record }))
+    if (lines.length > 200) lines = lines.slice(-200)
+    writeFileSync(file, lines.join('\n') + '\n')
+  } catch {}
+}
+
+/** 读取账本（排障/自检用；解析失败的行丢弃）。 */
+function readTitleLedger(limit = 20) {
+  try {
+    const lines = readFileSync(titleLedgerFile(), 'utf8').split('\n').filter(Boolean)
+    return lines
+      .slice(-Math.max(1, limit | 0))
+      .map((line) => {
+        try {
+          return JSON.parse(line)
+        } catch {
+          return { raw: line }
+        }
+      })
+  } catch {
+    return []
+  }
+}
+
+/**
+ * 执行一次标题请求：优先走 llm.prepareCall（与官方 dsh-session-title-llm 一致，
+ * 由适配器校验模型能力并补齐默认值），宿主未提供 prepareCall 时退回裸 llm.stream。
+ * @returns {Promise<string>} 标题文本
+ */
+async function runTitleAttempt({ ctx, dshLlm, cfg, attempt, system, framedInput, sessionId, signal, deadlineAt, trace }) {
+  const messages = [
+    dshLlm.createUserMessage({
+      content: [{ type: 'text', text: framedInput }],
+      source: { kind: 'plugin', plugin: PLUGIN_ID }
+    })
+  ]
+  const callConfig = { provider: attempt.route.provider, model: attempt.route.model }
+  if (attempt.maxTokens !== undefined) callConfig.maxTokens = attempt.maxTokens
+
+  let open
+  if (typeof ctx.llm.prepareCall === 'function') {
+    const call = await ctx.llm.prepareCall(callConfig, signal)
+    const options = Object.freeze({
+      ...call.config,
+      messages,
+      system,
+      sessionId,
+      purpose: 'session-title',
+      signal
+    })
+    open = () => call.stream(options)
+  } else {
+    const options = Object.freeze({ ...callConfig, messages, system, sessionId, purpose: 'session-title', signal })
+    open = () => ctx.llm.stream(options)
+  }
+
+  const assembler = new dshLlm.BlockAssembler()
+  for await (const chunk of open()) {
+    signal.throwIfAborted()
+    if (Date.now() > deadlineAt) throw new Error(`${PLUGIN_ID}: title request timed out after ${cfg.timeoutMs}ms`)
+    assembler.push(chunk)
+  }
+  signal.throwIfAborted()
+  if (trace) trace('stream-done', { attempt: attempt.label, finish: assembler.finish && assembler.finish.kind })
+
+  const finishKind = assembler.finish && assembler.finish.kind
+  if (finishKind && finishKind !== 'stop') {
+    throw new Error(`${PLUGIN_ID}: title finish reason "${finishKind}"`)
+  }
+  const blocks = assembler.blocks()
+  if (blocks.some((b) => b.type === 'tool-call')) {
+    throw new Error(`${PLUGIN_ID}: title output must be text only`)
+  }
+  const title = blocks
+    .filter((b) => b.type === 'text')
+    .map((b) => b.text)
+    .join(' ')
+    .trim()
+  if (!title) throw new Error(`${PLUGIN_ID}: title model produced no text`)
+  return title
 }
 
 // ── HTTP 辅助（对齐 dsh-continue）──────────────────────────────────────────
@@ -604,53 +780,54 @@ async function applyAsync(ctx, config = {}) {
 
       const system = systemPrompt(cfg)
       const deadlineAt = Date.now() + cfg.timeoutMs
-      // 对齐官方 dsh-session-title-llm 的 options 形状；freeze 仅浅防误改
-      //（官方的 deepFreeze 在 @deepseek-ai/dsh-util-values，dsh-llm 没有此导出）
-      const options = Object.freeze({
-        provider: route.provider,
-        model: route.model,
-        messages: [
-          dshLlm.createUserMessage({
-            content: [{ type: 'text', text: framedInput }],
-            source: { kind: 'plugin', plugin: PLUGIN_ID }
+      const attempts = buildTitleAttempts(cfg, route)
+      const failures = []
+      let title
+      let usedRoute = route
+      for (const attempt of attempts) {
+        request.signal.throwIfAborted()
+        try {
+          title = await runTitleAttempt({
+            ctx,
+            dshLlm,
+            cfg,
+            attempt,
+            system,
+            framedInput,
+            sessionId: request.session.id,
+            signal: request.signal,
+            deadlineAt,
+            trace
           })
-        ],
-        system,
-        maxTokens: cfg.maxOutputTokens,
-        sessionId: request.session.id,
-        purpose: 'session-title',
-        signal: request.signal
-      })
-
-      const assembler = new dshLlm.BlockAssembler()
-      try {
-        for await (const chunk of ctx.llm.stream(options)) {
-          request.signal.throwIfAborted()
-          if (Date.now() > deadlineAt) throw new Error(`${PLUGIN_ID}: title request timed out after ${cfg.timeoutMs}ms`)
-          assembler.push(chunk)
+          usedRoute = attempt.route
+          break
+        } catch (e) {
+          // 取消不换形态重试：调用方已经不要结果了，再试一次只会拖长宿主等待
+          if (request.signal.aborted) throw e
+          const message = String((e && e.message) || e).slice(0, 4000)
+          failures.push({ attempt: attempt.label, route: attempt.route, maxTokens: attempt.maxTokens, message })
+          trace('attempt-failed', {
+            attempt: attempt.label,
+            route: `${attempt.route.provider}/${attempt.route.model}`,
+            maxTokens: attempt.maxTokens,
+            message: message.slice(0, 300)
+          })
+          writeTitleFailureLedger(cfg, {
+            sessionId: request.session.id,
+            attempt: attempt.label,
+            route: attempt.route,
+            maxTokens: attempt.maxTokens,
+            code: (e && e.code) || undefined,
+            message
+          })
         }
-      } catch (e) {
-        trace('stream-error', { message: String((e && e.message) || e).slice(0, 300) })
-        throw e
       }
-      trace('stream-done', { finish: assembler.finish && assembler.finish.kind })
-      request.signal.throwIfAborted()
-
-      const finish = assembler.finish
-      const finishKind = finish && finish.kind
-      if (finishKind && finishKind !== 'stop') {
-        throw new Error(`${PLUGIN_ID}: title finish reason "${finishKind}"`)
+      if (title === undefined) {
+        const detail = failures
+          .map((f) => `${f.attempt}(${f.route.provider}/${f.route.model}${f.maxTokens === undefined ? '' : `, maxTokens=${f.maxTokens}`}): ${f.message}`)
+          .join(' | ')
+        throw new Error(`${PLUGIN_ID}: every title attempt failed — ${detail}`)
       }
-      const blocks = assembler.blocks()
-      if (blocks.some((b) => b.type === 'tool-call')) {
-        throw new Error(`${PLUGIN_ID}: title output must be text only`)
-      }
-      const title = blocks
-        .filter((b) => b.type === 'text')
-        .map((b) => b.text)
-        .join(' ')
-        .trim()
-      if (!title) throw new Error(`${PLUGIN_ID}: title model produced no text`)
 
       // 同题抑制：归一化后与现标题一致 → 静默返回现标题（服务写入同值，侧栏
       // 零变化、无失败告警）。LLM 非确定性导致的措辞/大小写抖动在这里被吸收。
@@ -664,14 +841,14 @@ async function applyAsync(ctx, config = {}) {
         return {
           title: currentTitle,
           messageSeqs: trimmed.filter((it) => it.role === 'user').map((it) => it.seq),
-          model: route
+          model: usedRoute
         }
       }
 
       return {
         title,
         messageSeqs: trimmed.filter((it) => it.role === 'user').map((it) => it.seq),
-        model: route
+        model: usedRoute
       }
     }
   }
@@ -765,6 +942,16 @@ async function applyAsync(ctx, config = {}) {
             sendJson(res, 200, {
               armed: Boolean(dshLlm),
               settings: safeSettings(effective())
+            })
+            return
+          }
+
+          // GET /dsh-smart-title/api/errors — 最近的失败账本（排障用）
+          if (req.method === 'GET' && apiPath.endsWith(`/${PLUGIN_ID}/api/errors`)) {
+            sendJson(res, 200, {
+              armed: Boolean(dshLlm),
+              file: titleLedgerFile(),
+              entries: readTitleLedger(20)
             })
             return
           }
@@ -872,6 +1059,13 @@ module.exports = {
     frameTranscript,
     systemPrompt,
     resolveRouteOverride,
+    buildTitleAttempts,
+    resolvePrimaryMaxTokens,
+    runTitleAttempt,
+    titleLedgerFile,
+    writeTitleFailureLedger,
+    readTitleLedger,
+    dropUnpairedRoute,
     settingsSchema,
     __seedDshLlm,
     __seedSchema,

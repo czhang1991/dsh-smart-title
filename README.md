@@ -20,6 +20,35 @@
 - **启动回填（可选）**：对标题仍是回退文案的活跃会话逐个补刷（默认关闭，可设开启与会话上限）
 - **模型可指定**：默认跟随会话当前模型，也可为标题单独指定一条便宜/快速的模型路由
 
+## 本 fork 的改动（v0.2.0）
+
+本仓库 fork 自 [weibaohui/dsh-smart-title](https://github.com/weibaohui/dsh-smart-title) @ 0.1.9，只做一件事：**让标题在「非官方 OpenAI 兼容网关」路由上也能生成成功**。
+
+现象：会话标题永远停在回退文案（首 5 词），而同一会话里的正常对话完全正常。定位到网关侧用量账本后确认——每次"出回退标题"的时刻都有一条 `400`：
+
+```
+{"code":11133,"msg":"the request parameters were rejected by the model provider",
+ "extError":{"code":"invalid_request_error"}}
+```
+
+即标题的辅助请求被上游按参数非法拒绝。逐会话比对路由与结果后发现相关性是 100%：`workbuddy-cn/*` 会话 0 个标题成功，`deepseek-official/*`、`deepseek-account/*` 会话 9/9 成功。差异点在于标题请求是这条路由上**唯一带显式 `max_tokens`、且不带 tools 的调用**。
+
+改动：
+
+1. **默认不带 `maxTokens`**（新设置 `sendMaxTokens`，默认 `false`）。原来无条件塞 `maxTokens: 2048`，与同路由的普通对话形态不一致。
+2. **改走 `ctx.llm.prepareCall`**，与官方 `dsh-session-title-llm` 一致：由适配器校验模型能力、补齐默认值后再 dispatch；宿主没有该能力时退回裸 `llm.stream`（向后兼容）。
+3. **失败自动换形态重试一次**（带 ↔ 不带 `maxTokens` 互换），仍失败再试**备用路由**（新设置 `fallbackProvider` / `fallbackModel`）。这样即使某条路由永久不接受辅助请求，标题也有兜底。
+4. **失败账本**：完整错误写入 `~/.dsh/plugin-data/dsh-smart-title/title-errors.jsonl`（保留最近 200 条），并可用 `GET /dsh-smart-title/api/errors` 读取。宿主的 logger 会过滤插件输出，原来这类失败只落在 stderr，排查时拿不到任何线索。
+5. 其余行为（节流、冻结、同题跳过、手动改名保护、启动回填、设置页）与上游一致。
+
+新增设置项（设置页可视化，保存即生效）：
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `sendMaxTokens` | `false` | 标题请求是否显式带 `maxTokens`（值取 `maxOutputTokens`） |
+| `fallbackProvider` / `fallbackModel` | 空 | 主路由两次尝试都失败后使用的备用路由（必须成对） |
+| `diagnostics` | `true` | 是否写失败账本 |
+
 ## 安装
 
 ```bash
@@ -52,6 +81,7 @@ dsh plugin --profile web add @weibaohui/dsh-smart-title -w
 
 | 插件版本 | 适配 dsh 版本 | 备注 |
 |---------|--------------|------|
+| 0.2.0（本 fork） | 0.1.7-rc.2 系（桌面版 app.asar 宿主实测） | 默认不带 maxTokens + 走 prepareCall + 换形态重试 + 备用路由 + 失败账本，修 WorkBuddy 网关 400 导致标题永不生成的缺陷 |
 | 0.1.8 | 0.1.7-rc.2 | 当前版本；修复降级路径 Config 导出 null——宿主 settings schema() 不排除 null，会炸 settings.describe() 拖垮整份设置文档（同 dsh-continue#4） |
 | 0.1.5 | 0.1.7-rc.2 | 修复宿主将 volatile 字段物化为 {} 导致的设置毒化（saneConfigValues 清洗 + 移除 Config 兼容字符串字段） |
 | 0.1.4 | 0.1.7-rc.2 | 适配 0.1.7 settings 模型（导出 volatile `Config`，`ctx.settings.update` 持久化），面板改动重启不再丢失 |

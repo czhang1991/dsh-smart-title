@@ -1,6 +1,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 const require = createRequire(import.meta.url)
 const { __internals } = require('../src/index.js')
@@ -24,6 +27,11 @@ const {
   frameTranscript,
   systemPrompt,
   resolveRouteOverride,
+  buildTitleAttempts,
+  resolvePrimaryMaxTokens,
+  writeTitleFailureLedger,
+  readTitleLedger,
+  dropUnpairedRoute,
   DEFAULTS
 } = __internals
 
@@ -689,4 +697,197 @@ test('every route sits behind the connection trust fence', async () => {
   const res = { statusCode: null, code: null, body: null, writeHead(c) { this.statusCode = c; this.code = c }, end(b) { this.body = b } }
   await handler({ method: 'GET', url: '/dsh-smart-title/api/status', headers: {} }, res)
   assert.equal(res.statusCode, 401, 'unauthenticated status read is refused')
+})
+
+// ── v0.2.0：请求形态阶梯 / prepareCall / 失败账本 ─────────────────────────
+
+test('resolvePrimaryMaxTokens: 默认不带 maxTokens，显式开启才带', async () => {
+  assert.equal(resolvePrimaryMaxTokens({}), undefined)
+  assert.equal(resolvePrimaryMaxTokens({ sendMaxTokens: false, maxOutputTokens: 2048 }), undefined)
+  assert.equal(resolvePrimaryMaxTokens({ sendMaxTokens: true, maxOutputTokens: 2048 }), 2048)
+  assert.equal(resolvePrimaryMaxTokens({ sendMaxTokens: true, maxOutputTokens: 0 }), undefined)
+})
+
+test('buildTitleAttempts: 主形态 → 互换形态 → 备用路由', async () => {
+  const route = { provider: 'workbuddy-cn', model: 'deepseek-v4.1-flash' }
+
+  // 默认（不带 maxTokens）→ 主形态 + 带 maxTokens 的重试
+  const a = buildTitleAttempts({ sendMaxTokens: false, maxOutputTokens: 2048 }, route)
+  assert.deepEqual(a.map((x) => x.label), ['primary', 'primary-alt-max-tokens'])
+  assert.equal(a[0].maxTokens, undefined)
+  assert.equal(a[1].maxTokens, 2048)
+  assert.equal(a[0].route, route)
+
+  // 显式开启 → 主形态带 maxTokens，重试改为不带
+  const b = buildTitleAttempts({ sendMaxTokens: true, maxOutputTokens: 2048 }, route)
+  assert.equal(b[0].maxTokens, 2048)
+  assert.equal(b[1].maxTokens, undefined)
+
+  // 配了备用路由 → 追加一次，且沿用主形态的 maxTokens 策略
+  const c = buildTitleAttempts(
+    { sendMaxTokens: false, maxOutputTokens: 2048, fallbackProvider: 'deepseek-official', fallbackModel: 'deepseek-flash' },
+    route
+  )
+  assert.deepEqual(c.map((x) => x.label), ['primary', 'primary-alt-max-tokens', 'fallback'])
+  assert.deepEqual(c[2].route, { provider: 'deepseek-official', model: 'deepseek-flash' })
+  assert.equal(c[2].maxTokens, undefined)
+
+  // 半配对备用路由 = 未提供
+  const d = buildTitleAttempts({ sendMaxTokens: false, fallbackProvider: 'p', fallbackModel: '' }, route)
+  assert.equal(d.some((x) => x.label === 'fallback'), false)
+})
+
+test('dropUnpairedRoute / sanitizePatch: 备用路由同样要求成对', async () => {
+  const patch = { fallbackProvider: 'p', fallbackModel: '' }
+  dropUnpairedRoute(patch, 'fallbackProvider', 'fallbackModel')
+  assert.deepEqual(patch, {})
+
+  assert.deepEqual(
+    sanitizePatch({ fallbackProvider: ' dp ', fallbackModel: ' df ' }),
+    { fallbackProvider: 'dp', fallbackModel: 'df' }
+  )
+  assert.deepEqual(sanitizePatch({ fallbackProvider: 'dp' }), {})
+  assert.equal(sanitizePatch({ sendMaxTokens: true }).sendMaxTokens, true)
+  assert.equal(sanitizePatch({ diagnostics: false }).diagnostics, false)
+})
+
+function makePrepareLlm({ failStreams = 0, text = '会话标题插件' } = {}) {
+  const calls = []
+  return {
+    calls,
+    prepareCall(config, signal) {
+      calls.push({ kind: 'prepare', config, signal })
+      const resolved = { provider: config.provider, model: config.model }
+      if (config.maxTokens !== undefined) resolved.maxTokens = config.maxTokens
+      return Promise.resolve({
+        config: resolved,
+        model: { provider: config.provider, id: config.model },
+        stream(options) {
+          calls.push({ kind: 'stream', options })
+          const index = calls.filter((c) => c.kind === 'stream').length
+          return (async function* () {
+            if (index <= failStreams) throw new Error('400 model_param_invalid: request parameters were rejected')
+            for (const chunk of genChunks(text)) yield chunk
+          })()
+        }
+      })
+    }
+  }
+}
+
+test('generate: 走 prepareCall、默认不带 maxTokens、带上 purpose/sessionId', async () => {
+  seedFakeLlm()
+  const apply = loadApply()
+  const session = genSession('s-prepare')
+  const { ctx, registered } = makeMockCtx({ session, titleText: '旧标题' })
+  await apply(ctx, {})
+  const llm = makePrepareLlm()
+  ctx.llm = llm
+
+  const result = await registered[0].generate({
+    session,
+    messages: [{ seq: 7, text: '帮我写个插件' }],
+    route: { provider: 'workbuddy-cn', model: 'deepseek-v4.1-flash' },
+    signal: { throwIfAborted() {}, aborted: false }
+  })
+
+  assert.equal(result.title, '会话标题插件')
+  assert.deepEqual(result.messageSeqs, [7])
+  assert.deepEqual(result.model, { provider: 'workbuddy-cn', model: 'deepseek-v4.1-flash' })
+
+  assert.equal(llm.calls.filter((c) => c.kind === 'prepare').length, 1, '只用一次尝试就成功')
+  const prepare = llm.calls.find((c) => c.kind === 'prepare')
+  assert.deepEqual(prepare.config, { provider: 'workbuddy-cn', model: 'deepseek-v4.1-flash' })
+  assert.equal(prepare.config.maxTokens, undefined, '默认不显式带 maxTokens')
+
+  const stream = llm.calls.find((c) => c.kind === 'stream')
+  assert.equal(stream.options.purpose, 'session-title')
+  assert.equal(stream.options.sessionId, 's-prepare')
+  assert.equal(stream.options.maxTokens, undefined)
+  assert.ok(stream.options.messages.length === 1)
+  assert.ok(typeof stream.options.system === 'string' && stream.options.system.length > 0)
+})
+
+test('generate: 首次失败自动换形态重试（第二次带 maxTokens）', async () => {
+  seedFakeLlm()
+  const apply = loadApply()
+  const session = genSession('s-retry')
+  const { ctx, registered } = makeMockCtx({ session, titleText: '旧标题' })
+  const ledgerDir = mkdtempSync(join(tmpdir(), 'dsh-title-ledger-'))
+  process.env.DSH_SMART_TITLE_LEDGER_DIR = ledgerDir
+  try {
+    await apply(ctx, {})
+    const llm = makePrepareLlm({ failStreams: 1 })
+    ctx.llm = llm
+
+    const result = await registered[0].generate({
+      session,
+      messages: [{ seq: 7, text: '帮我写个插件' }],
+      route: { provider: 'workbuddy-cn', model: 'deepseek-v4.1-flash' },
+      signal: { throwIfAborted() {}, aborted: false }
+    })
+
+    assert.equal(result.title, '会话标题插件')
+    const prepares = llm.calls.filter((c) => c.kind === 'prepare')
+    assert.equal(prepares.length, 2, '失败一次后换形态再试')
+    assert.equal(prepares[0].config.maxTokens, undefined)
+    assert.equal(prepares[1].config.maxTokens, DEFAULTS.maxOutputTokens)
+
+    const ledger = readTitleLedger(10)
+    assert.equal(ledger.length, 1)
+    assert.equal(ledger[0].attempt, 'primary')
+    assert.equal(ledger[0].sessionId, 's-retry')
+    assert.match(ledger[0].message, /model_param_invalid/)
+    assert.equal(ledger[0].route.provider, 'workbuddy-cn')
+  } finally {
+    delete process.env.DSH_SMART_TITLE_LEDGER_DIR
+    rmSync(ledgerDir, { recursive: true, force: true })
+  }
+})
+
+test('generate: 全部尝试失败时抛聚合错误；diagnostics=false 不写账本', async () => {
+  seedFakeLlm()
+  const apply = loadApply()
+  const session = genSession('s-allfail')
+  const { ctx, registered } = makeMockCtx({ session, titleText: '旧标题' })
+  const ledgerDir = mkdtempSync(join(tmpdir(), 'dsh-title-ledger-'))
+  process.env.DSH_SMART_TITLE_LEDGER_DIR = ledgerDir
+  try {
+    await apply(ctx, { diagnostics: false, fallbackProvider: 'deepseek-official', fallbackModel: 'deepseek-flash' })
+    const llm = makePrepareLlm({ failStreams: 99 })
+    ctx.llm = llm
+
+    await assert.rejects(
+      registered[0].generate({
+        session,
+        messages: [{ seq: 7, text: '帮我写个插件' }],
+        route: { provider: 'workbuddy-cn', model: 'deepseek-v4.1-flash' },
+        signal: { throwIfAborted() {}, aborted: false }
+      }),
+      (error) => {
+        assert.match(error.message, /every title attempt failed/)
+        assert.match(error.message, /fallback\(deepseek-official\/deepseek-flash/)
+        return true
+      }
+    )
+    assert.equal(llm.calls.filter((c) => c.kind === 'prepare').length, 3, '主形态 + 互换 + 备用路由')
+    assert.deepEqual(readTitleLedger(10), [], 'diagnostics=false 时不落账本')
+  } finally {
+    delete process.env.DSH_SMART_TITLE_LEDGER_DIR
+    rmSync(ledgerDir, { recursive: true, force: true })
+  }
+})
+
+test('writeTitleFailureLedger: 只保留最近 200 条', async () => {
+  const ledgerDir = mkdtempSync(join(tmpdir(), 'dsh-title-ledger-'))
+  process.env.DSH_SMART_TITLE_LEDGER_DIR = ledgerDir
+  try {
+    for (let i = 0; i < 205; i++) writeTitleFailureLedger({ diagnostics: true }, { attempt: 'primary', message: `e${i}` })
+    const all = readTitleLedger(1000)
+    assert.equal(all.length, 200)
+    assert.equal(all[all.length - 1].message, 'e204')
+  } finally {
+    delete process.env.DSH_SMART_TITLE_LEDGER_DIR
+    rmSync(ledgerDir, { recursive: true, force: true })
+  }
 })
