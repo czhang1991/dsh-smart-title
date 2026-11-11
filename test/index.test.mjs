@@ -29,6 +29,13 @@ const {
   resolveRouteOverride,
   buildTitleAttempts,
   resolvePrimaryMaxTokens,
+  titleLanguageDirective,
+  DEFAULT_LANGUAGE_DIRECTIVE,
+  routeKeyOf,
+  isRouteDown,
+  noteRouteFailure,
+  noteRouteSuccess,
+  ROUTE_FAILURES_TO_TRIP,
   writeTitleFailureLedger,
   readTitleLedger,
   dropUnpairedRoute,
@@ -935,6 +942,116 @@ test('generate: finish=error 时把上游 failure 原文带进错误与账本（
     assert.equal(ledger.length, 2, '两次形态都失败')
     assert.match(ledger[0].message, /model_param_invalid/, '账本保留上游原文')
     assert.equal(ledger[0].code, 'UPSTREAM_400')
+  } finally {
+    delete process.env.DSH_SMART_TITLE_LEDGER_DIR
+    rmSync(ledgerDir, { recursive: true, force: true })
+  }
+})
+
+// ── 语言跟随 / 路由熔断 ────────────────────────────────────────────────────
+
+test('titleLanguageDirective: 按用户消息判语言，中文会话必须中文标题', async () => {
+  assert.match(titleLanguageDirective(['帮我检查一下插件为什么不重命名会话']), /MUST be written in Chinese/)
+  assert.match(titleLanguageDirective(['帮我看看', 'git rebase 冲突怎么解决']), /MUST be written in Chinese/)
+  assert.match(titleLanguageDirective(['fix the flaky title generator please']), /write the title in English/)
+  assert.equal(titleLanguageDirective(['@素材/素材3.jpg']), DEFAULT_LANGUAGE_DIRECTIVE)
+  assert.equal(titleLanguageDirective([]), DEFAULT_LANGUAGE_DIRECTIVE)
+})
+
+test('systemPrompt: 语言指令可注入，未注入时回落到通用指令', async () => {
+  const cfg = { targetWords: 6, targetCjkCharacters: 12 }
+  assert.ok(systemPrompt(cfg).includes(DEFAULT_LANGUAGE_DIRECTIVE))
+  assert.ok(systemPrompt(cfg, 'X-EXPLICIT-DIRECTIVE').includes('X-EXPLICIT-DIRECTIVE'))
+})
+
+test('route health: 连败进入冷却、到期恢复、成功即清零', async () => {
+  const health = new Map()
+  const key = routeKeyOf({ provider: 'a', model: 'b' })
+  assert.equal(key, 'a/b')
+  assert.equal(isRouteDown(health, key, 1000), false)
+  noteRouteFailure(health, key, 1000, 600000)
+  assert.equal(isRouteDown(health, key, 1000), false, '一次失败不熔断')
+  const entry = noteRouteFailure(health, key, 1000, 600000)
+  assert.equal(entry.failures, ROUTE_FAILURES_TO_TRIP)
+  assert.equal(isRouteDown(health, key, 1001), true)
+  assert.equal(isRouteDown(health, key, 1000 + 600000 + 1), false, '冷却到期自动恢复')
+  noteRouteSuccess(health, key)
+  assert.equal(isRouteDown(health, key, 1001), false)
+})
+
+test('buildTitleAttempts: 主路由冷却时把备用路由提到最前', async () => {
+  const route = { provider: 'workbuddy-cn', model: 'deepseek-v4.1-flash' }
+  const cfg = {
+    sendMaxTokens: false,
+    maxOutputTokens: 2048,
+    fallbackProvider: 'deepseek-official',
+    fallbackModel: 'deepseek-flash'
+  }
+  assert.deepEqual(buildTitleAttempts(cfg, route, () => false).map((a) => a.label), [
+    'primary',
+    'primary-alt-max-tokens',
+    'fallback'
+  ])
+  assert.deepEqual(buildTitleAttempts(cfg, route, () => true).map((a) => a.label), [
+    'fallback',
+    'primary',
+    'primary-alt-max-tokens'
+  ])
+  assert.deepEqual(buildTitleAttempts({ sendMaxTokens: false }, route, () => true).map((a) => a.label), ['primary'])
+})
+
+function makeRouteAwareLlm({ failingProvider = 'workbuddy-cn', text = '会话标题插件' } = {}) {
+  const calls = []
+  return {
+    calls,
+    prepareCall(config) {
+      calls.push({ kind: 'prepare', config })
+      const resolved = { provider: config.provider, model: config.model }
+      return Promise.resolve({
+        config: resolved,
+        stream() {
+          calls.push({ kind: 'stream', route: `${config.provider}/${config.model}` })
+          return (async function* () {
+            if (config.provider === failingProvider) throw new Error('400 model_param_invalid')
+            for (const chunk of genChunks(text)) yield chunk
+          })()
+        }
+      })
+    }
+  }
+}
+
+test('generate: 主路由连败后自动优先备用路由', async () => {
+  seedFakeLlm()
+  const apply = loadApply()
+  const session = genSession('s-health')
+  const { ctx, registered } = makeMockCtx({ session, titleText: '旧标题' })
+  const ledgerDir = mkdtempSync(join(tmpdir(), 'dsh-title-ledger-'))
+  process.env.DSH_SMART_TITLE_LEDGER_DIR = ledgerDir
+  try {
+    await apply(ctx, { fallbackProvider: 'deepseek-official', fallbackModel: 'deepseek-flash' })
+    const llm = makeRouteAwareLlm()
+    ctx.llm = llm
+    const request = () => ({
+      session,
+      messages: [{ seq: 7, text: '帮我写个插件' }],
+      route: { provider: 'workbuddy-cn', model: 'deepseek-v4.1-flash' },
+      signal: { throwIfAborted() {}, aborted: false }
+    })
+    const routesOf = () => llm.calls.filter((c) => c.kind === 'stream').map((c) => c.route)
+
+    const first = await registered[0].generate(request())
+    assert.equal(first.title, '会话标题插件')
+    assert.deepEqual(routesOf(), [
+      'workbuddy-cn/deepseek-v4.1-flash',
+      'workbuddy-cn/deepseek-v4.1-flash',
+      'deepseek-official/deepseek-flash'
+    ])
+
+    llm.calls.length = 0
+    const second = await registered[0].generate(request())
+    assert.equal(second.title, '会话标题插件')
+    assert.deepEqual(routesOf(), ['deepseek-official/deepseek-flash'], '冷却期内直接走备用路由')
   } finally {
     delete process.env.DSH_SMART_TITLE_LEDGER_DIR
     rmSync(ledgerDir, { recursive: true, force: true })

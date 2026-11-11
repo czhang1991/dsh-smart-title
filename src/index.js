@@ -160,7 +160,10 @@ const DEFAULTS = Object.freeze({
   fallbackProvider: '',
   fallbackModel: '',
   // 失败账本：每次失败把完整错误写进 ~/.dsh/plugin-data/dsh-smart-title/title-errors.jsonl
-  diagnostics: true
+  diagnostics: true,
+  // 路由熔断冷却（ms）：同一路由的两种形态都失败后，冷却期内把它的尝试排到
+  // 备用路由之后（不硬禁用，仍会尝试、仍会记账），0 = 关闭熔断
+  routeCooldownMs: 600000
 })
 
 const SETTINGS_NS = 'dsh-smart-title'
@@ -190,7 +193,8 @@ function settingsSchema(Schema) {
     sendMaxTokens: Schema.boolean().default(DEFAULTS.sendMaxTokens).volatile(),
     fallbackProvider: Schema.string().default(DEFAULTS.fallbackProvider).volatile(),
     fallbackModel: Schema.string().default(DEFAULTS.fallbackModel).volatile(),
-    diagnostics: Schema.boolean().default(DEFAULTS.diagnostics).volatile()
+    diagnostics: Schema.boolean().default(DEFAULTS.diagnostics).volatile(),
+    routeCooldownMs: Schema.number().step(1000).min(0).max(3600000).default(DEFAULTS.routeCooldownMs).volatile()
   })
 }
 
@@ -304,7 +308,8 @@ const NUM_RANGES = Object.freeze({
   refreshMinIntervalMs: [0, 3600000],
   refreshMaxTurns: [0, 100000],
   backfillMaxSessions: [1, 200],
-  backfillIntervalMs: [0, 60000]
+  backfillIntervalMs: [0, 60000],
+  routeCooldownMs: [0, 3600000]
 })
 const BOOL_KEYS = Object.freeze(['enabled', 'includeAssistant', 'refreshOnTurnEnd', 'excludeForks', 'backfillOnStart', 'sendMaxTokens', 'diagnostics'])
 const STR_KEYS = Object.freeze(['provider', 'model', 'excludeIdPrefixes', 'fallbackProvider', 'fallbackModel'])
@@ -469,14 +474,38 @@ function frameTranscript(items) {
   return `从下面这段「用户与 AI 编码助手」的对话 JSON 中，总结出这条会话的标题：\n${JSON.stringify(framed)}`
 }
 
-function systemPrompt(cfg) {
+function systemPrompt(cfg, languageDirective) {
   return [
     'Create a concise title for an AI coding-assistant session from the supplied conversation excerpt (user messages and assistant replies).',
     'The title should reflect what the session is actually about or trying to accomplish, not merely repeat the first sentence.',
     'Return only the title on one line, **in plain text of natural language**, with no quotes, prefix, explanation, Markdown, XML, or terminal control codes. No code is allowed.',
-    'Use the dominant language of the conversation.',
+    // 语言跟随"用户怎么写"，而不是"对话里哪种字符多"：中文会话里工具输出、
+    // 代码、英文系统提示往往占大多数，按字符占比挑语言会把标题带成英文。
+    languageDirective || DEFAULT_LANGUAGE_DIRECTIVE,
     `Aim for about ${cfg.targetWords} words in non-CJK languages or ${cfg.targetCjkCharacters} CJK characters.`
   ].join('\n')
+}
+
+const DEFAULT_LANGUAGE_DIRECTIVE = 'Use the dominant language of the conversation.'
+
+const CJK_PATTERN = /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\u3040-\u30FF]/g
+
+/**
+ * 从"用户消息"推断标题语言，给出硬约束。
+ * 只统计用户自己写的话（不含助手回答与工具输出），阈值取 CJK≥8 且不低于拉丁
+ * 字符的一半——纯代码粘贴、URL 为主的会话仍回落到通用指令。
+ */
+function titleLanguageDirective(userTexts) {
+  const text = Array.isArray(userTexts) ? userTexts.join(' ') : String(userTexts || '')
+  const cjk = (text.match(CJK_PATTERN) || []).length
+  const latin = (text.match(/[A-Za-z]/g) || []).length
+  if (cjk >= 8 && cjk >= latin * 0.5) {
+    return 'The user writes in Chinese: the title MUST be written in Chinese. Latin characters are allowed only inside code identifiers, file names, or product names.'
+  }
+  if (latin >= 8 && cjk === 0) {
+    return 'The user writes in English: write the title in English.'
+  }
+  return DEFAULT_LANGUAGE_DIRECTIVE
 }
 
 // ── 请求形态阶梯 / 失败账本（v0.2.0）──────────────────────────────────────
@@ -496,10 +525,10 @@ function resolvePrimaryMaxTokens(cfg) {
  * 构造尝试阶梯：主形态 → 另一形态（带/不带 maxTokens 互换）→ 备用路由。
  * 之所以失败就换形态再试一次：从错误文本上无法可靠区分"参数被网关拒绝"与
  * "该模型/路由不接受辅助请求"，而标题请求本身只有 1~2k token，重试很便宜。
+ * isDown(route) 为真时把该路由的同组尝试挪到最后——网关刚拒绝过的路由先别撞。
  */
-function buildTitleAttempts(cfg, route) {
+function buildTitleAttempts(cfg, route, isDown) {
   const primaryMaxTokens = resolvePrimaryMaxTokens(cfg)
-  const attempts = [{ label: 'primary', route, maxTokens: primaryMaxTokens }]
   const configured = Number(cfg && cfg.maxOutputTokens)
   // 互换形态：显式带 → 这次改为不带；默认不带 → 这次改为带上配置值。
   // 两个方向互为对照——"网关是否讨厌 max_tokens"只有实测才知道。
@@ -509,12 +538,49 @@ function buildTitleAttempts(cfg, route) {
       : Number.isFinite(configured) && configured > 0
         ? configured
         : undefined
+  const primaryAttempts = [{ label: 'primary', route, maxTokens: primaryMaxTokens }]
   if (swapped !== primaryMaxTokens) {
-    attempts.push({ label: 'primary-alt-max-tokens', route, maxTokens: swapped })
+    primaryAttempts.push({ label: 'primary-alt-max-tokens', route, maxTokens: swapped })
   }
   const fallback = resolveRouteOverride(cfg && cfg.fallbackProvider, cfg && cfg.fallbackModel)
-  if (fallback) attempts.push({ label: 'fallback', route: fallback, maxTokens: primaryMaxTokens })
-  return attempts
+  const fallbackAttempts = fallback ? [{ label: 'fallback', route: fallback, maxTokens: primaryMaxTokens }] : []
+  const primaryDown = typeof isDown === 'function' ? isDown(route) : false
+  if (primaryDown && fallbackAttempts.length > 0) return [...fallbackAttempts, ...primaryAttempts]
+  return [...primaryAttempts, ...fallbackAttempts]
+}
+
+// ── 路由健康度（熔断/粘滞）───────────────────────────────────────────────
+
+/** 同一路由连败这么多次（= 两种形态都试过）就先判它"不可用"。 */
+const ROUTE_FAILURES_TO_TRIP = 2
+
+function routeKeyOf(route) {
+  if (!route || typeof route.provider !== 'string') return '?/?'
+  return `${route.provider}/${route.model}`
+}
+
+/** 该路由是否处于冷却期（这段时间内把它的尝试排到最后）。 */
+function isRouteDown(health, key, now) {
+  if (!health || typeof health.get !== 'function') return false
+  const entry = health.get(key)
+  return Boolean(entry && entry.downUntil > (now === undefined ? Date.now() : now))
+}
+
+/** 记一次失败；达到阈值且有冷却时长时置冷却截止时间。 */
+function noteRouteFailure(health, key, now, cooldownMs) {
+  if (!health || typeof health.get !== 'function') return { failures: 0, downUntil: 0 }
+  const at = now === undefined ? Date.now() : now
+  const entry = health.get(key) || { failures: 0, downUntil: 0 }
+  entry.failures += 1
+  if (entry.failures >= ROUTE_FAILURES_TO_TRIP && cooldownMs > 0) entry.downUntil = at + cooldownMs
+  health.set(key, entry)
+  return entry
+}
+
+/** 成功一次即视为健康（冷却立即解除）。 */
+function noteRouteSuccess(health, key) {
+  if (!health || typeof health.set !== 'function') return
+  health.set(key, { failures: 0, downUntil: 0 })
 }
 
 /** 失败账本文件路径；DSH_SMART_TITLE_LEDGER_DIR 可覆盖（测试与排障用）。 */
@@ -754,6 +820,9 @@ async function applyAsync(ctx, config = {}) {
   // 每会话最近一次标题生成时刻（含官方 first-prompt 首题路径——它们都走
   // provider.generate）。refreshSession 的节流闸据此放行/拦截。
   const lastGenerateAt = new Map()
+  // 路由健康度（进程内）：同一路由两种形态都失败 → 冷却期内把它的尝试排到
+  // 备用路由之后；任意一次成功立即恢复。进程重启清零，代价只是多试一次。
+  const routeHealth = new Map()
 
   // ── 提供方：标题生成（唯一注册位，本插件接管）──────────────────────────
   const provider = {
@@ -786,9 +855,13 @@ async function applyAsync(ctx, config = {}) {
       const route = override || request.route
       if (!route) throw new Error(`${PLUGIN_ID}: no route available; configure provider/model together`)
 
-      const system = systemPrompt(cfg)
+      const userTexts = trimmed.filter((it) => it.role === 'user').map((it) => it.text)
+      const system = systemPrompt(cfg, titleLanguageDirective(userTexts))
       const deadlineAt = Date.now() + cfg.timeoutMs
-      const attempts = buildTitleAttempts(cfg, route)
+      const attempts = buildTitleAttempts(cfg, route, (candidate) => isRouteDown(routeHealth, routeKeyOf(candidate)))
+      if (attempts.length > 0 && attempts[0].label === 'fallback') {
+        trace('route-reordered', { primary: routeKeyOf(route), cooldownMs: Number(cfg.routeCooldownMs) || 0 })
+      }
       const failures = []
       let title
       let usedRoute = route
@@ -808,6 +881,7 @@ async function applyAsync(ctx, config = {}) {
             trace
           })
           usedRoute = attempt.route
+          noteRouteSuccess(routeHealth, routeKeyOf(attempt.route))
           break
         } catch (e) {
           // 取消不换形态重试：调用方已经不要结果了，再试一次只会拖长宿主等待
@@ -826,9 +900,14 @@ async function applyAsync(ctx, config = {}) {
             attempt: attempt.label,
             route: attempt.route,
             maxTokens: attempt.maxTokens,
-            code: (e && e.code) || undefined,
+            code,
             message
           })
+          const cooldownMs = Number(cfg.routeCooldownMs) || 0
+          const tripped = noteRouteFailure(routeHealth, routeKeyOf(attempt.route), Date.now(), cooldownMs)
+          if (tripped.downUntil > Date.now()) {
+            trace('route-tripped', { route: routeKeyOf(attempt.route), cooldownMs })
+          }
         }
       }
       if (title === undefined) {
@@ -1073,6 +1152,13 @@ module.exports = {
     resolveRouteOverride,
     buildTitleAttempts,
     resolvePrimaryMaxTokens,
+    titleLanguageDirective,
+    DEFAULT_LANGUAGE_DIRECTIVE,
+    routeKeyOf,
+    isRouteDown,
+    noteRouteFailure,
+    noteRouteSuccess,
+    ROUTE_FAILURES_TO_TRIP,
     runTitleAttempt,
     titleLedgerFile,
     writeTitleFailureLedger,

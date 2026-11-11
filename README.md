@@ -38,8 +38,10 @@
 1. **默认不带 `maxTokens`**（新设置 `sendMaxTokens`，默认 `false`）。原来无条件塞 `maxTokens: 2048`，与同路由的普通对话形态不一致。
 2. **改走 `ctx.llm.prepareCall`**，与官方 `dsh-session-title-llm` 一致：由适配器校验模型能力、补齐默认值后再 dispatch；宿主没有该能力时退回裸 `llm.stream`（向后兼容）。
 3. **失败自动换形态重试一次**（带 ↔ 不带 `maxTokens` 互换），仍失败再试**备用路由**（新设置 `fallbackProvider` / `fallbackModel`）。这样即使某条路由永久不接受辅助请求，标题也有兜底。
-4. **失败账本**：完整错误写入 `~/.dsh/plugin-data/dsh-smart-title/title-errors.jsonl`（保留最近 200 条），并可用 `GET /dsh-smart-title/api/errors` 读取。宿主的 logger 会过滤插件输出，原来这类失败只落在 stderr，排查时拿不到任何线索。
-5. 其余行为（节流、冻结、同题跳过、手动改名保护、启动回填、设置页）与上游一致。
+4. **失败账本**：完整错误写入 `~/.dsh/plugin-data/dsh-smart-title/title-errors.jsonl`（保留最近 200 条），并可用 `GET /dsh-smart-title/api/errors` 读取。宿主的 logger 会过滤插件输出，原来这类失败只落在 stderr，排查时拿不到任何线索。**同时把上游 `finish.failure` 的原文与 code 带进错误与账本**（否则只剩一句 `finish reason "error"`）。
+5. **路由熔断/粘滞**：同一路由的两种形态都失败后进入冷却（默认 10 分钟），冷却期内把它的尝试排到备用路由之后；任意一次成功立即恢复。网关偶发拒绝时不必每次先撞两次墙。
+6. **标题语言跟随用户**：只根据**用户消息**判断语言（CJK≥8 且不低于拉丁字符一半 → 强制中文标题）。原来只看"对话主导语言"，中文会话里工具输出与代码占多数时标题会被带成英文。
+7. 其余行为（节流、冻结、同题跳过、手动改名保护、启动回填、设置页）与上游一致。
 
 新增设置项（设置页可视化，保存即生效）：
 
@@ -48,6 +50,7 @@
 | `sendMaxTokens` | `false` | 标题请求是否显式带 `maxTokens`（值取 `maxOutputTokens`） |
 | `fallbackProvider` / `fallbackModel` | 空 | 主路由两次尝试都失败后使用的备用路由（必须成对） |
 | `diagnostics` | `true` | 是否写失败账本 |
+| `routeCooldownMs` | `600000` | 路由熔断冷却时长（0=关闭熔断） |
 
 ## 安装
 
