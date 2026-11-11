@@ -891,3 +891,52 @@ test('writeTitleFailureLedger: 只保留最近 200 条', async () => {
     rmSync(ledgerDir, { recursive: true, force: true })
   }
 })
+
+test('generate: finish=error 时把上游 failure 原文带进错误与账本（不再只剩一句 finish reason）', async () => {
+  seedFakeLlm()
+  const apply = loadApply()
+  const session = genSession('s-finish-error')
+  const { ctx, registered } = makeMockCtx({ session, titleText: '旧标题' })
+  const ledgerDir = mkdtempSync(join(tmpdir(), 'dsh-title-ledger-'))
+  process.env.DSH_SMART_TITLE_LEDGER_DIR = ledgerDir
+  try {
+    await apply(ctx, {})
+    const upstream = '{"code":11133,"msg":"model_param_invalid","param":"messages"}'
+    ctx.llm = {
+      prepareCall(config) {
+        return Promise.resolve({
+          config: { provider: config.provider, model: config.model },
+          stream() {
+            return (async function* () {
+              yield { type: 'block-start', index: 0, blockType: 'text' }
+              yield { type: 'text-delta', index: 0, text: '半截' }
+              yield { type: 'finish', reason: { kind: 'error', failure: { message: upstream, code: 'UPSTREAM_400' } } }
+            })()
+          }
+        })
+      }
+    }
+
+    await assert.rejects(
+      registered[0].generate({
+        session,
+        messages: [{ seq: 7, text: '帮我写个插件' }],
+        route: { provider: 'workbuddy-cn', model: 'deepseek-v4.1-flash' },
+        signal: { throwIfAborted() {}, aborted: false }
+      }),
+      (error) => {
+        assert.match(error.message, /model_param_invalid/)
+        assert.equal(error.code, 'UPSTREAM_400')
+        return true
+      }
+    )
+
+    const ledger = readTitleLedger(5)
+    assert.equal(ledger.length, 2, '两次形态都失败')
+    assert.match(ledger[0].message, /model_param_invalid/, '账本保留上游原文')
+    assert.equal(ledger[0].code, 'UPSTREAM_400')
+  } finally {
+    delete process.env.DSH_SMART_TITLE_LEDGER_DIR
+    rmSync(ledgerDir, { recursive: true, force: true })
+  }
+})

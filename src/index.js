@@ -605,7 +605,15 @@ async function runTitleAttempt({ ctx, dshLlm, cfg, attempt, system, framedInput,
 
   const finishKind = assembler.finish && assembler.finish.kind
   if (finishKind && finishKind !== 'stop') {
-    throw new Error(`${PLUGIN_ID}: title finish reason "${finishKind}"`)
+    // error/aborted 的 finish 里带着上游真正的失败信息（message + code），
+    // 官方 terminalFinish 也是这么取的；丢掉它等于把唯一的证据扔了。
+    const failure = assembler.finish && assembler.finish.failure
+    const failureMessage = failure && typeof failure.message === 'string' ? failure.message : ''
+    const failureCode = failure && failure.code
+    const detail = failureMessage ? ` — ${failureMessage}${failureCode ? ` [${failureCode}]` : ''}` : ''
+    const error = new Error(`${PLUGIN_ID}: title finish reason "${finishKind}"${detail}`)
+    if (failureCode) error.code = failureCode
+    throw error
   }
   const blocks = assembler.blocks()
   if (blocks.some((b) => b.type === 'tool-call')) {
@@ -805,7 +813,8 @@ async function applyAsync(ctx, config = {}) {
           // 取消不换形态重试：调用方已经不要结果了，再试一次只会拖长宿主等待
           if (request.signal.aborted) throw e
           const message = String((e && e.message) || e).slice(0, 4000)
-          failures.push({ attempt: attempt.label, route: attempt.route, maxTokens: attempt.maxTokens, message })
+          const code = (e && e.code) || undefined
+          failures.push({ attempt: attempt.label, route: attempt.route, maxTokens: attempt.maxTokens, code, message })
           trace('attempt-failed', {
             attempt: attempt.label,
             route: `${attempt.route.provider}/${attempt.route.model}`,
@@ -826,7 +835,10 @@ async function applyAsync(ctx, config = {}) {
         const detail = failures
           .map((f) => `${f.attempt}(${f.route.provider}/${f.route.model}${f.maxTokens === undefined ? '' : `, maxTokens=${f.maxTokens}`}): ${f.message}`)
           .join(' | ')
-        throw new Error(`${PLUGIN_ID}: every title attempt failed — ${detail}`)
+        const error = new Error(`${PLUGIN_ID}: every title attempt failed — ${detail}`)
+        const lastCode = failures.length ? failures[failures.length - 1].code : undefined
+        if (lastCode) error.code = lastCode
+        throw error
       }
 
       // 同题抑制：归一化后与现标题一致 → 静默返回现标题（服务写入同值，侧栏
